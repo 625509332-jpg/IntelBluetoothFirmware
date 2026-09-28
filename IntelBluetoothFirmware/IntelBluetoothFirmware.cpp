@@ -103,8 +103,13 @@ void IntelBluetoothFirmware::publishReg(bool isSucceed, const char *fwName)
     if (isSucceed)
         setProperty("fw_name", OSString::withCString(fwName));
     // Monterey+
-    if (version_major >= 21)
+    if (version_major >= 21) {
         m_pDevice->setName("Bluetooth USB Host Controller");
+        // bluetoothd 的 bm3_usb GetProductAndVendorID 靠 "USB Product Name" 属性
+        // 识别内部控制器，AX200 的 iProduct=0 不会生成该属性，需手动注入
+        m_pDevice->setProperty("USB Product Name", "Bluetooth USB Host Controller");
+        m_pDevice->setProperty("USB Vendor Name", "Intel");
+    }
 }
 
 void IntelBluetoothFirmware::cleanUp()
