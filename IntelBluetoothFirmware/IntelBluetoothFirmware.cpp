@@ -74,6 +74,8 @@ bool IntelBluetoothFirmware::start(IOService *provider)
     }
     if (currentType == kTypeGen1) {
         m_pBTIntel = new IntelBluetoothOpsGen1();
+    } else if (currentType == kTypeGen2) {
+        m_pBTIntel = new IntelBluetoothOpsGen2();
     } else {
         m_pBTIntel = new IntelBluetoothOpsGen3();
     }
