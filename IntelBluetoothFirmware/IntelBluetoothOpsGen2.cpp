@@ -194,8 +194,20 @@ download:
     fwData = requestFirmwareData(fwname, true);
     if (!fwData) {
         if (firmwareMode) {
-            /* Firmware has already been loaded */
-            return true;
+            /* The controller is running operational firmware, but no firmware
+             * file matching its reported revision was found. This happens when
+             * the built-in firmware is outdated: its "fw_revision" (used to
+             * build the .sfi filename) is stale and no longer ships with the
+             * driver (e.g. AX200 reports fw_revision 0 -> "ibt-20-0-0.sfi",
+             * while only "ibt-20-0-3.sfi" is available).
+             *
+             * Reset the controller to bootloader mode so that, after it
+             * re-enumerates, the bootloader reports the correct revision and
+             * the matching (newer) firmware is downloaded and booted.
+             */
+            XYLog("Operational firmware file %s missing, reset to bootloader to update\n", fwname);
+            resetToBootloader();
+            return false;
         }
         XYLog("Failed to load Intel firmware file %s\n", fwname);
         return false;
