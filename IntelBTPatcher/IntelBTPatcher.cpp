@@ -9,12 +9,6 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
 
-#include <IOKit/usb/IOUSBHostPipe.h>
-#include <IOKit/usb/IOUSBHostIOSource.h>
-#include <IOKit/usb/IOUSBHostDevice.h>
-#include <IOKit/usb/StandardUSB.h>
-#include <libkern/OSByteOrder.h>
-
 #include "IntelBTPatcher.hpp"
 
 static CIntelBTPatcher ibtPatcher;
@@ -266,25 +260,12 @@ newPipeIo(void *that, void *dataBuffer, uint32_t dataBufferLength,
     IOUSBHostCompletion *comp = (IOUSBHostCompletion *)completion;
     IOMemoryDescriptor *buf = (IOMemoryDescriptor *)dataBuffer;
 
-    /* Fast path: only wrap asynchronous reads with room for the 12-byte
-     * replacement event; everything else is passed through untouched. */
+    /* Minimal validation build: wrap every asynchronous pipe read that can
+     * hold the 12-byte replacement event. All other requests pass through
+     * untouched. The completion callback only acts on the exact 0xfc79
+     * Command-Complete error bytes, so every other device is unaffected
+     * beyond one tiny alloc/free per async IO. */
     if (!comp || !comp->action || !buf || dataBufferLength < 12)
-        return real(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
-
-    /* Restrict wrapping to the AX200 so every other USB device is unaffected
-     * and allocates nothing. */
-    IOUSBHostPipe *pipe = (IOUSBHostPipe *)that;
-    bool ax200 = false;
-    if (pipe) {
-        IOUSBHostDevice *dev = pipe->getDevice();
-        if (dev) {
-            const StandardUSB::DeviceDescriptor *dd = dev->getDeviceDescriptor();
-            if (dd && OSSwapLittleToHostInt16(dd->idVendor) == 0x8087 &&
-                OSSwapLittleToHostInt16(dd->idProduct) == 0x0029)
-                ax200 = true;
-        }
-    }
-    if (!ax200)
         return real(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
 
     PipeIoCtx *ctx = (PipeIoCtx *)IOMalloc(sizeof(PipeIoCtx));
