@@ -163,7 +163,21 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     HciCommandHdr *hdr = nullptr;
     uint32_t hdrLen = 0;
     char hciBuf[MAX_HCI_BUF_LEN] = {0};
-    
+
+    /* [DIAG] unconditional trace of class control requests (0xE0 cmd OUT /
+     * 0xE1 event IN) so the Sequoia bm3_usb transport path is visible. */
+    {
+        uint8_t rtype = (request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase;
+        if (rtype == kRequestTypeClass || request.bRequest == 0xE0 || request.bRequest == 0xE1) {
+            SYSLOG(DRV_NAME, "[DIAG-REQ] bReq=0x%02x dir=%s type=%s recip=%s wVal=0x%04x wIdx=0x%04x wLen=%d data=%p desc=%p async=%d",
+                   request.bRequest,
+                   requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase],
+                   requestTypeNames[rtype],
+                   requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase],
+                   request.wValue, request.wIndex, request.wLength, data, descriptor, completion != nullptr);
+        }
+    }
+
     if (data == nullptr) {
         if (descriptor != nullptr &&
             (getKernelVersion() < KernelVersion::Sequoia || !descriptor->prepare(kIODirectionOut))) {
@@ -205,16 +219,11 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
         // HCI reset, we need to send Random address again
         if (hdr->opcode == HCI_OP_RESET)
             _randomAddressInit = false;
-#if DEBUG
-        DBGLOG(DRV_NAME, "[%s] bRequest: 0x%x direction: %s type: %s recipient: %s wValue: 0x%02x wIndex: 0x%02x opcode: 0x%04x len: %d length: %d async: %d", provider->getName(), request.bRequest, requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase], requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase], requestTypeNames[(request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase], request.wValue, request.wIndex, hdr->opcode, hdr->len, request.wLength, completion != nullptr);
-        if (hdrLen) {
-            const char *dump = _hexDumpHCIData((uint8_t *)hdr, hdrLen);
-            if (dump) {
-                DBGLOG(DRV_NAME, "[Request]: %s", dump);
-                IOFree((void *)dump, hdrLen * 3 + 1);
-            }
-        }
-#endif
+        /* [DIAG] unconditional opcode trace; explicitly flag the Broadcom
+         * Read Verbose Config Version Info (0xfc79) that Intel lacks. */
+        SYSLOG(DRV_NAME, "[DIAG-OP] opcode=0x%04x plen=%d%s",
+               hdr->opcode, hdr->len,
+               hdr->opcode == 0xfc79 ? "  <<<< BCM Read Verbose Config Version Info" : "");
     }
     return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
 }
