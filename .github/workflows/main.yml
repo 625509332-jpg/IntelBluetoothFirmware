@@ -42,7 +42,9 @@ jobs:
 
     - name: Debug Build
       run: |
-        xcodebuild -alltargets -configuration Debug | xcpretty && exit ${PIPESTATUS[0]}
+        set -o pipefail
+        xcodebuild -alltargets -configuration Debug 2>&1 | grep -vE "^\s*$" | tail -120
+        exit ${PIPESTATUS[0]}
 
     - name: Release Build
       run: |

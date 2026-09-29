@@ -12,6 +12,8 @@
 #include <IOKit/usb/IOUSBHostPipe.h>
 #include <IOKit/usb/IOUSBHostIOSource.h>
 #include <IOKit/usb/IOUSBHostDevice.h>
+#include <IOKit/usb/StandardUSB.h>
+#include <libkern/OSByteOrder.h>
 
 #include "IntelBTPatcher.hpp"
 
@@ -277,8 +279,8 @@ newPipeIo(void *that, void *dataBuffer, uint32_t dataBufferLength,
         IOUSBHostDevice *dev = pipe->getDevice();
         if (dev) {
             const StandardUSB::DeviceDescriptor *dd = dev->getDeviceDescriptor();
-            if (dd && USBToHost16(dd->idVendor) == 0x8087 &&
-                USBToHost16(dd->idProduct) == 0x0029)
+            if (dd && OSSwapLittleToHostInt16(dd->idVendor) == 0x8087 &&
+                OSSwapLittleToHostInt16(dd->idProduct) == 0x0029)
                 ax200 = true;
         }
     }
