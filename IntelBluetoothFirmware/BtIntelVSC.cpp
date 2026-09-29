@@ -199,10 +199,17 @@ resetToBootloader()
      *                0x01 (Specified boot address)
      * boot_param:    Boot address
      *
+     * To drop the controller from operational mode into the bootloader
+     * (so new firmware can be downloaded) the reset MUST be a soft reset
+     * with patches disabled and DDC reload disabled (all zeroes), matching
+     * the Linux btintel_reset_to_bootloader() sequence. Using 0x01 for
+     * reset_type/patch_enable/ddc_reload instead re-activates the existing
+     * operational firmware and the controller never enters the bootloader,
+     * which leaves a stale built-in firmware running.
      */
-    params.reset_type = 0x01;
-    params.patch_enable = 0x01;
-    params.ddc_reload = 0x01;
+    params.reset_type = 0x00;
+    params.patch_enable = 0x00;
+    params.ddc_reload = 0x00;
     params.boot_option = 0x00;
     params.boot_param = OSSwapHostToLittleInt32(0x00000000);
     
