@@ -91,7 +91,80 @@ setup()
     if (!intelVersionInfo(&ver)) {
         return false;
     }
-    
+
+    /* AX200 (CcP) can keep a stale operational firmware whose reported
+     * fw_revision no longer matches any firmware shipped in the driver
+     * (it reports 0 -> "ibt-20-0-0.sfi", while only "ibt-20-0-3.sfi"
+     * exists). That old firmware does not understand the HCI vendor
+     * commands issued by newer macOS (Sequoia) and HCI init times out.
+     *
+     * Drop the controller back into its bootloader in-place and keep
+     * driving it over the same USB pipes. No USB re-enumeration happens:
+     * the product id stays 0x0029, only fw_variant changes to 0x06.
+     * Then fall through to the regular bootloader download path. This
+     * mirrors the Linux btusb new-gen setup sequence: Intel Reset (all
+     * zeroes) -> HCI Reset -> wait -> re-read version.
+     */
+    if (ver.fw_variant == 0x23) {
+        char fwname[64];
+        IntelBootParams tmpParams;
+        OSData *existingFw = NULL;
+
+        memset(&tmpParams, 0, sizeof(tmpParams));
+        if (getFirmware(&ver, &tmpParams, fwname, sizeof(fwname), "sfi")
+            && (existingFw = requestFirmwareData(fwname, true)) == NULL) {
+            uint8_t ioBuf[CMD_BUF_MAX_SIZE];
+            HciCommandHdr *hciReset;
+            uint32_t drainLen = 0;
+            int i;
+
+            XYLog("Stale operational firmware (%s not shipped), entering bootloader in-place\n", fwname);
+
+            /* 1) Intel vendor reset, patches disabled (all-zero params) */
+            if (!resetToBootloader()) {
+                XYLog("Intel reset to bootloader failed\n");
+                return false;
+            }
+
+            /* 2) Standard HCI Reset completes the mode switch. Its Command
+             * Complete may not arrive while firmware is dropping, so send
+             * it without blocking; stale events are drained below.
+             */
+            memset(ioBuf, 0, sizeof(ioBuf));
+            hciReset = (HciCommandHdr *)ioBuf;
+            hciReset->opcode = OSSwapHostToLittleInt16(HCI_OP_RESET);
+            hciReset->len = 0;
+            m_pUSBDeviceController->sendHCIRequest(hciReset, HCI_INIT_TIMEOUT);
+            IOSleep(100);
+
+            /* 3) Re-read version, expecting bootloader (0x06). Drain any
+             * leftover Command Complete before each attempt; retry a few
+             * times as the controller takes a moment to come alive.
+             */
+            for (i = 0; i < 3; i++) {
+                drainLen = 0;
+                m_pUSBDeviceController->interruptPipeRead(ioBuf, sizeof(ioBuf), &drainLen, 200);
+                if (readVersion(&ver) && ver.fw_variant == 0x06) {
+                    break;
+                }
+                IOSleep(100);
+            }
+            if (ver.fw_variant != 0x06) {
+                XYLog("Controller did not enter bootloader (fw_variant=0x%02x)\n", ver.fw_variant);
+                return false;
+            }
+            XYLog("Controller entered bootloader after stale firmware reset\n");
+            if (!intelVersionInfo(&ver)) {
+                return false;
+            }
+        } else {
+            /* A matching operational firmware file exists: nothing stale,
+             * keep the normal "already running" download/skip path.
+             */
+            OSSafeReleaseNULL(existingFw);
+        }
+    }
+
     return bootloaderSetup(&ver);
 }
 
@@ -194,20 +267,10 @@ download:
     fwData = requestFirmwareData(fwname, true);
     if (!fwData) {
         if (firmwareMode) {
-            /* The controller is running operational firmware, but no firmware
-             * file matching its reported revision was found. This happens when
-             * the built-in firmware is outdated: its "fw_revision" (used to
-             * build the .sfi filename) is stale and no longer ships with the
-             * driver (e.g. AX200 reports fw_revision 0 -> "ibt-20-0-0.sfi",
-             * while only "ibt-20-0-3.sfi" is available).
-             *
-             * Reset the controller to bootloader mode so that, after it
-             * re-enumerates, the bootloader reports the correct revision and
-             * the matching (newer) firmware is downloaded and booted.
+            /* Firmware has already been loaded. Stale-firmware recovery
+             * (reset to bootloader in-place) is handled earlier in setup().
              */
-            XYLog("Operational firmware file %s missing, reset to bootloader to update\n", fwname);
-            resetToBootloader();
-            return false;
+            return true;
         }
         XYLog("Failed to load Intel firmware file %s\n", fwname);
         return false;
