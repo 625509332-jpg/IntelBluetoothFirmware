@@ -9,6 +9,10 @@
 #include <Headers/kern_util.hpp>
 #include <Headers/plugin_start.hpp>
 
+#include <IOKit/usb/IOUSBHostPipe.h>
+#include <IOKit/usb/IOUSBHostIOSource.h>
+#include <IOKit/usb/IOUSBHostDevice.h>
+
 #include "IntelBTPatcher.hpp"
 
 static CIntelBTPatcher ibtPatcher;
@@ -128,6 +132,21 @@ void CIntelBTPatcher::processKext(KernelPatcher &patcher, size_t index, mach_vm_
                 SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", hostDeviceRequest.symbol, patcher.getError());
                 patcher.clearError();
             }
+
+            /* Intercept bulk/interrupt pipe async completions so the
+             * unsupported Broadcom 0xfc79 response can be rewritten. */
+            KernelPatcher::RouteRequest pipeIoRequest {
+                "__ZN14IOUSBHostPipe2ioEP18IOMemoryDescriptorjP19IOUSBHostCompletionj",
+                newPipeIo,
+                oldPipeIo
+            };
+            patcher.routeMultiple(index, &pipeIoRequest, 1, address, size);
+            if (patcher.getError() == KernelPatcher::Error::NoError) {
+                SYSLOG(DRV_NAME, "routed %s", pipeIoRequest.symbol);
+            } else {
+                SYSLOG(DRV_NAME, "failed to resolve %s, error = %d", pipeIoRequest.symbol, patcher.getError());
+                patcher.clearError();
+            }
         }
     }
 }
@@ -163,21 +182,7 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
     HciCommandHdr *hdr = nullptr;
     uint32_t hdrLen = 0;
     char hciBuf[MAX_HCI_BUF_LEN] = {0};
-
-    /* [DIAG] unconditional trace of class control requests (0xE0 cmd OUT /
-     * 0xE1 event IN) so the Sequoia bm3_usb transport path is visible. */
-    {
-        uint8_t rtype = (request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase;
-        if (rtype == kRequestTypeClass || request.bRequest == 0xE0 || request.bRequest == 0xE1) {
-            SYSLOG(DRV_NAME, "[DIAG-REQ] bReq=0x%02x dir=%s type=%s recip=%s wVal=0x%04x wIdx=0x%04x wLen=%d data=%p desc=%p async=%d",
-                   request.bRequest,
-                   requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase],
-                   requestTypeNames[rtype],
-                   requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase],
-                   request.wValue, request.wIndex, request.wLength, data, descriptor, completion != nullptr);
-        }
-    }
-
+    
     if (data == nullptr) {
         if (descriptor != nullptr &&
             (getKernelVersion() < KernelVersion::Sequoia || !descriptor->prepare(kIODirectionOut))) {
@@ -219,11 +224,118 @@ IOReturn CIntelBTPatcher::newHostDeviceRequest(void *that, IOService *provider, 
         // HCI reset, we need to send Random address again
         if (hdr->opcode == HCI_OP_RESET)
             _randomAddressInit = false;
-        /* [DIAG] unconditional opcode trace; explicitly flag the Broadcom
-         * Read Verbose Config Version Info (0xfc79) that Intel lacks. */
-        SYSLOG(DRV_NAME, "[DIAG-OP] opcode=0x%04x plen=%d%s",
-               hdr->opcode, hdr->len,
-               hdr->opcode == 0xfc79 ? "  <<<< BCM Read Verbose Config Version Info" : "");
+#if DEBUG
+        DBGLOG(DRV_NAME, "[%s] bRequest: 0x%x direction: %s type: %s recipient: %s wValue: 0x%02x wIndex: 0x%02x opcode: 0x%04x len: %d length: %d async: %d", provider->getName(), request.bRequest, requestDirectionNames[(request.bmRequestType & kDeviceRequestDirectionMask) >> kDeviceRequestDirectionPhase], requestRecipientNames[(request.bmRequestType & kDeviceRequestRecipientMask) >> kDeviceRequestRecipientPhase], requestTypeNames[(request.bmRequestType & kDeviceRequestTypeMask) >> kDeviceRequestTypePhase], request.wValue, request.wIndex, hdr->opcode, hdr->len, request.wLength, completion != nullptr);
+        if (hdrLen) {
+            const char *dump = _hexDumpHCIData((uint8_t *)hdr, hdrLen);
+            if (dump) {
+                DBGLOG(DRV_NAME, "[Request]: %s", dump);
+                IOFree((void *)dump, hdrLen * 3 + 1);
+            }
+        }
+#endif
     }
     return FunctionCast(newHostDeviceRequest, callbackIBTPatcher->oldHostDeviceRequest)(that, provider, request, data, descriptor, length, completion, timeout);
+}
+
+#pragma mark - Sequoia: rewrite Broadcom 0xfc79 error on interrupt-IN
+
+/* The Intel AX200 replies to the Broadcom-specific "Read Verbose Config
+ * Version Info" VSC (0xfc79), which Sequoia's bluetoothd issues during
+ * Stack_Init, with a Command Complete carrying an error status and no
+ * payload. bluetoothd treats that as a fatal transport failure
+ * (reason=108) and keeps restarting. We wrap the interrupt-IN pipe async
+ * completion for the AX200 and, when that exact error event arrives,
+ * replace it in place with a successful Broadcom response so init proceeds.
+ */
+
+struct PipeIoCtx {
+    IOUSBHostCompletion origCompletion;
+    IOMemoryDescriptor *buffer;
+};
+
+IOReturn CIntelBTPatcher::
+newPipeIo(void *that, void *dataBuffer, uint32_t dataBufferLength,
+          void *completion, uint32_t completionTimeoutMs)
+{
+    using PipeIoFn = IOReturn (*)(void *, void *, uint32_t, void *, uint32_t);
+    PipeIoFn real = FunctionCast(newPipeIo, callbackIBTPatcher->oldPipeIo);
+
+    IOUSBHostCompletion *comp = (IOUSBHostCompletion *)completion;
+    IOMemoryDescriptor *buf = (IOMemoryDescriptor *)dataBuffer;
+
+    /* Fast path: only wrap asynchronous reads with room for the 12-byte
+     * replacement event; everything else is passed through untouched. */
+    if (!comp || !comp->action || !buf || dataBufferLength < 12)
+        return real(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
+
+    /* Restrict wrapping to the AX200 so every other USB device is unaffected
+     * and allocates nothing. */
+    IOUSBHostPipe *pipe = (IOUSBHostPipe *)that;
+    bool ax200 = false;
+    if (pipe) {
+        IOUSBHostDevice *dev = pipe->getDevice();
+        if (dev) {
+            const StandardUSB::DeviceDescriptor *dd = dev->getDeviceDescriptor();
+            if (dd && USBToHost16(dd->idVendor) == 0x8087 &&
+                USBToHost16(dd->idProduct) == 0x0029)
+                ax200 = true;
+        }
+    }
+    if (!ax200)
+        return real(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
+
+    PipeIoCtx *ctx = (PipeIoCtx *)IOMalloc(sizeof(PipeIoCtx));
+    if (!ctx)
+        return real(that, dataBuffer, dataBufferLength, completion, completionTimeoutMs);
+
+    ctx->origCompletion = *comp;
+    ctx->buffer = buf;
+
+    IOUSBHostCompletion wrapped;
+    wrapped.owner = ctx;
+    wrapped.action = pipeIoAction;
+    wrapped.parameter = nullptr;
+
+    IOReturn ret = real(that, dataBuffer, dataBufferLength, &wrapped, completionTimeoutMs);
+    if (ret != kIOReturnSuccess) {
+        /* Request not accepted; the completion will never run. */
+        IOFree(ctx, sizeof(PipeIoCtx));
+        return ret;
+    }
+    return ret;
+}
+
+void CIntelBTPatcher::
+pipeIoAction(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred)
+{
+    PipeIoCtx *ctx = (PipeIoCtx *)owner;
+    uint32_t reported = bytesTransferred;
+
+    if (ctx && status == kIOReturnSuccess && ctx->buffer &&
+        bytesTransferred >= 6 && ctx->buffer->getLength() >= 12) {
+        uint8_t hdr[6] = {};
+        if (ctx->buffer->readBytes(0, hdr, sizeof(hdr)) == (IOByteCount)sizeof(hdr) &&
+            hdr[0] == 0x0e &&                    /* HCI Command Complete */
+            hdr[3] == 0x79 && hdr[4] == 0xfc &&  /* opcode 0xfc79 (LE) */
+            hdr[5] != 0x00) {                    /* chip returned an error */
+            /* Successful Broadcom Read Verbose Config Version Info:
+             * status=0 followed by 6 bytes (chip id / revision / build). */
+            static const uint8_t kFakeVerboseConfigCC[12] = {
+                0x0e, 0x0a, 0x01, 0x79, 0xfc, 0x00,
+                0xe8, 0x03, 0x00, 0x00, 0x39, 0x15
+            };
+            if (ctx->buffer->writeBytes(0, kFakeVerboseConfigCC,
+                                        sizeof(kFakeVerboseConfigCC))
+                == (IOByteCount)sizeof(kFakeVerboseConfigCC))
+                reported = (uint32_t)sizeof(kFakeVerboseConfigCC);
+        }
+    }
+
+    if (ctx) {
+        if (ctx->origCompletion.action)
+            ctx->origCompletion.action(ctx->origCompletion.owner, parameter,
+                                       status, reported);
+        IOFree(ctx, sizeof(PipeIoCtx));
+    }
 }

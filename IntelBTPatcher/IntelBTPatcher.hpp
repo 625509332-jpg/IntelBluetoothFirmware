@@ -83,9 +83,15 @@ public:
     
     static IOReturn newHostDeviceRequest(void *that, IOService *provider, StandardUSB::DeviceRequest &request, void *data, IOMemoryDescriptor *descriptor, unsigned int &length,IOUSBHostCompletion *completion, unsigned int timeout);
 
-    
+    /* Minimal Sequoia fix: intercept the interrupt-IN completion and turn
+     * the unsupported Broadcom VSC 0xfc79 (Read Verbose Config Version
+     * Info) error response into a successful one, so bluetoothd proceeds. */
+    static IOReturn newPipeIo(void *that, void *dataBuffer, uint32_t dataBufferLength, void *completion, uint32_t completionTimeoutMs);
+    static void pipeIoAction(void *owner, void *parameter, IOReturn status, uint32_t bytesTransferred);
+
     mach_vm_address_t oldFindQueueRequest {};
     mach_vm_address_t oldHostDeviceRequest {};
+    mach_vm_address_t oldPipeIo {};
     
 private:
     static bool _randomAddressInit;
